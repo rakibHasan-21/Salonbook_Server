@@ -13,6 +13,20 @@ app.use(cors({
 }));
 app.use(express.json());
 // Test route
+
+
+// verifyToken
+const verifyCustomer = (req, res, next) => {
+  if (req.user.role === "admin") {
+    return res.status(403).send({
+      message: "Admins cannot book appointments",
+    });
+  }
+
+  next();
+};
+
+// UI api Call
 app.get("/", (req, res) => {
   res.send("SalonBook Server is Running!");
 });
@@ -61,24 +75,20 @@ app.get("/services", async (req, res) => {
 
 app.get("/services/:id", async (req, res) => {
   const { id } = req.params;
-
   try {
     if (!ObjectId.isValid(id)) {
       return res.status(400).send({
         message: "Invalid service ID",
       });
     }
-
     const service = await servicesCollection.findOne({
       _id: new ObjectId(id),
     });
-
     if (!service) {
       return res.status(404).send({
         message: "Service not found",
       });
     }
-
     res.send(service);
   } catch (error) {
     res.status(500).send({
