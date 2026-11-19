@@ -45,6 +45,7 @@ export async function connectToMongoDB() {
 const Connection = await connectToMongoDB();
 const database = Connection.db("SalonBook");
 const servicesCollection = database.collection('services')
+const appointmentsCollection = database.collection("appointments");
 
 
 // services/Featured 
@@ -97,6 +98,128 @@ app.get("/services/:id", async (req, res) => {
   }
 });
 
+// booking services
+app.post("/bookings", async (req, res) => {
+  try {
+    const bookingData = req.body;
+
+    const newBooking = {
+      ...bookingData,
+      status: "Pending",
+      createdAt: new Date(),
+    };
+
+    const result = await appointmentsCollection.insertOne(newBooking);
+
+    res.status(201).send({
+      success: true,
+      message: "Appointment booked successfully",
+      insertedId: result.insertedId,
+    });
+  } catch (error) {
+    console.error(error);
+
+    res.status(500).send({
+      success: false,
+      message: "Failed to book appointment",
+    });
+  }
+});
+
+
+// app.get("/customer/dashboard-stats", verifyCustomer, async (req, res) => {
+//   try {
+//     const email = req.user.email;
+
+//     const total = await appointmentsCollection.countDocuments({
+//       customerEmail: email,
+//     });
+//     const pending = await appointmentsCollection.countDocuments({
+//       customerEmail: email,
+//       status: "Pending",
+//     });
+//     const confirmed = await appointmentsCollection.countDocuments({
+//       customerEmail: email,
+//       status: "Confirmed",
+//     });
+//     const cancelled = await appointmentsCollection.countDocuments({
+//       customerEmail: email,
+//       status: "Cancelled",
+//     });
+//     res.send({
+//       success: true,
+//       stats: {
+//         total,
+//         pending,
+//         confirmed,
+//         cancelled,
+//       },
+//     });
+//   } catch (error) {
+//     res.status(500).send({
+//       success: false,
+//       message: "Failed to fetch dashboard statistics",
+//     });
+//   }
+// });
+
+
+app.get("/customer/dashboard-stats", verifyCustomer, async (req, res) => {
+  try {
+    // Temporary testing only
+    const total = await appointmentsCollection.countDocuments();
+
+    const pending = await appointmentsCollection.countDocuments({
+      status: "Pending",
+    });
+
+    const confirmed = await appointmentsCollection.countDocuments({
+      status: "Confirmed",
+    });
+
+    const cancelled = await appointmentsCollection.countDocuments({
+      status: "Cancelled",
+    });
+
+    res.send({
+      success: true,
+      stats: {
+        total,
+        pending,
+        confirmed,
+        cancelled,
+      },
+    });
+  } catch (error) {
+    console.error(error);
+
+    res.status(500).send({
+      success: false,
+      message: "Failed to fetch dashboard statistics",
+    });
+  }
+});
+
+
+// /customer/appointments
+app.get("/customer/appointments", verifyCustomer, async (req, res) => {
+  try {
+    const result = await appointmentsCollection
+      .find({})
+      .sort({ createdAt: -1 })
+      .toArray();
+    res.send({
+      success: true,
+      appointments: result,
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({
+      success: false,
+      message: "Failed to fetch appointments",
+    });
+  }
+});
 app.listen(PORT, () => {
   console.log(`SalonBook server running on port ${PORT}`);
 });
