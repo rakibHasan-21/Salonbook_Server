@@ -1,28 +1,180 @@
 import express from "express";
 import { MongoClient, ObjectId } from 'mongodb';
 import cors from "cors";
+import multer from "multer";
+import fs from "node:fs";
+import path from "node:path";
+import { randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
+import { createRemoteJWKSet, jwtVerify } from "jose";
 import "dotenv/config";
 
 const PORT = process.env.PORT || 5000;
 const app = express();
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const uploadsRoot = path.join(__dirname, "uploads");
+const serviceUploadsDir = path.join(uploadsRoot, "services");
+
+fs.mkdirSync(serviceUploadsDir, { recursive: true });
+
 // Middleware
 app.use(cors({
   origin: "http://localhost:3000",
   credentials: true,
+  allowedHeaders: ["Content-Type", "Authorization"],
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
 }));
 app.use(express.json());
+app.use("/uploads", express.static(uploadsRoot, { maxAge: "7d" }));
+
+const authBaseURL = (
+  process.env.BETTER_AUTH_URL || "http://localhost:3000"
+).replace(/\/$/, "");
+const authOrigin = new URL(authBaseURL).origin;
+const authPath = authBaseURL.endsWith("/api/auth")
+  ? authBaseURL
+  : `${authBaseURL}/api/auth`;
+const jwks = createRemoteJWKSet(new URL(`${authPath}/jwks`));
+
+// Verify the Better Auth token and attach the user to the request.
+app.use(async (req, res, next) => {
+  const isProtectedPath =
+    req.path.startsWith("/customer/") ||
+    req.path.startsWith("/admin/") ||
+    req.path === "/bookings";
+
+  if (req.method === "OPTIONS" || !isProtectedPath) {
+    return next();
+  }
+
+  const authorization = req.headers.authorization;
+
+  if (authorization?.startsWith("Bearer ")) {
+    try {
+      const { payload } = await jwtVerify(
+        authorization.slice(7),
+        jwks,
+        {
+          issuer: authOrigin,
+          audience: authOrigin,
+        }
+      );
+
+      console.log("JWT PAYLOAD:", payload);
+
+      req.user = payload;
+      return next();
+    } catch (error) {
+      console.error("JWT verification failed:", error.message);
+    }
+  }
+
+  if (req.headers.cookie) {
+    try {
+      const sessionResponse = await fetch(`${authPath}/get-session`, {
+        headers: {
+          cookie: req.headers.cookie,
+        },
+      });
+
+      if (sessionResponse.ok) {
+        const sessionData = await sessionResponse.json();
+        const user = sessionData?.user ?? sessionData?.data?.user;
+
+        if (user) {
+          req.user = user;
+          return next();
+        }
+      }
+    } catch (error) {
+      console.error("Session lookup failed:", error.message);
+    }
+  }
+
+  next();
+});
+
 // Test route
+const upload = multer({
+  storage: multer.memoryStorage(),
+});
 
 
 // verifyToken
 const verifyCustomer = (req, res, next) => {
-  if (req.user.role === "admin") {
-    return res.status(403).send({
-      message: "Admins cannot book appointments",
+  if (!req.user) {
+    return res.status(401).send({
+      success: false,
+      message: "Unauthorized access",
     });
   }
 
+  if (req.user.role !== "customer") {
+    return res.status(403).send({
+      success: false,
+      message: "Only customers can access this resource",
+    });
+  }
+
+  if (req.user.isBlocked === true) {
+    return res.status(403).send({
+      success: false,
+      message: "Your account has been blocked",
+    });
+  }
+
+  next();
+};
+
+// verifyAdmin
+const verifyAdmin = async (req, res, next) => {
+  if (!req.user) {
+    return res.status(401).send({
+      success: false,
+      message: "Unauthorized access",
+    });
+  }
+
+  let role = req.user.role;
+  let isBlocked = req.user.isBlocked === true;
+
+  // The JWT payload may not carry role/isBlocked, so confirm with the database.
+  if (req.user.email) {
+    try {
+      const user = await usersCollection.findOne(
+        { email: req.user.email },
+        { projection: { role: 1, isBlocked: 1 } }
+      );
+
+      if (user) {
+        role = user.role;
+        isBlocked = user.isBlocked === true;
+      }
+    } catch (error) {
+      console.error("Admin role lookup failed:", error);
+      return res.status(500).send({
+        success: false,
+        message: "Failed to verify admin access",
+      });
+    }
+  }
+
+  if (role !== "admin") {
+    return res.status(403).send({
+      success: false,
+      message: "Only admins can access this resource",
+    });
+  }
+
+  if (isBlocked) {
+    return res.status(403).send({
+      success: false,
+      message: "Your account has been blocked",
+    });
+  }
+
+  req.user.role = role;
   next();
 };
 
@@ -46,6 +198,98 @@ const Connection = await connectToMongoDB();
 const database = Connection.db("SalonBook");
 const servicesCollection = database.collection('services')
 const appointmentsCollection = database.collection("appointments");
+const usersCollection = database.collection("user");
+const transactionsCollection = database.collection("transactions");
+
+const SERVICE_STATUSES = new Set(["active", "inactive"]);
+
+const validateServicePayload = (body, { partial = false } = {}) => {
+  const input = body && typeof body === "object" ? body : {};
+  const has = (field) => Object.prototype.hasOwnProperty.call(input, field);
+  const errors = [];
+  const data = {};
+
+  if (!partial || has("serviceName")) {
+    const serviceName =
+      typeof input.serviceName === "string" ? input.serviceName.trim() : "";
+
+    if (!serviceName) {
+      errors.push("Service name is required.");
+    } else {
+      data.serviceName = serviceName;
+    }
+  }
+
+  if (!partial || has("category")) {
+    const category =
+      typeof input.category === "string" ? input.category.trim() : "";
+
+    if (!category) {
+      errors.push("Category is required.");
+    } else {
+      data.category = category;
+    }
+  }
+
+  if (has("description")) {
+    if (typeof input.description !== "string") {
+      errors.push("Description must be text.");
+    } else {
+      data.description = input.description.trim();
+    }
+  } else if (!partial) {
+    data.description = "";
+  }
+
+  if (!partial || has("price")) {
+    const price =
+      typeof input.price === "number" ? input.price : Number(input.price);
+
+    if (!Number.isFinite(price) || price < 0) {
+      errors.push("Price must be a number greater than or equal to 0.");
+    } else {
+      data.price = price;
+    }
+  }
+
+  if (!partial || has("duration")) {
+    const duration =
+      typeof input.duration === "number"
+        ? input.duration
+        : Number(input.duration);
+
+    if (!Number.isFinite(duration) || duration <= 0) {
+      errors.push("Duration must be a number greater than 0.");
+    } else {
+      data.duration = duration;
+    }
+  }
+
+  if (has("image")) {
+    if (typeof input.image !== "string") {
+      errors.push("Image must be a URL.");
+    } else {
+      data.image = input.image.trim();
+    }
+  } else if (!partial) {
+    data.image = "";
+  }
+
+  if (has("status")) {
+    const status =
+      typeof input.status === "string" ? input.status.toLowerCase() : "";
+
+    if (!SERVICE_STATUSES.has(status)) {
+      errors.push("Status must be either active or inactive.");
+    } else {
+      data.status = status;
+    }
+  } else if (!partial) {
+    data.status = "active";
+  }
+
+  return { data, errors };
+};
 
 
 // services/Featured 
@@ -82,8 +326,10 @@ app.get("/services/:id", async (req, res) => {
         message: "Invalid service ID",
       });
     }
+    // Inactive services are not visible on the public site.
     const service = await servicesCollection.findOne({
       _id: new ObjectId(id),
+      status: "active",
     });
     if (!service) {
       return res.status(404).send({
@@ -99,88 +345,217 @@ app.get("/services/:id", async (req, res) => {
 });
 
 // booking services
-app.post("/bookings", async (req, res) => {
+
+
+app.post("/bookings", verifyCustomer, async (req, res) => {
   try {
-    const bookingData = req.body;
+    const {
+      serviceId,
+      appointmentDate,
+      appointmentTime,
+      customerMessage,
+    } = req.body;
+
+    // 1. Validate service ID
+    if (!serviceId || !ObjectId.isValid(serviceId)) {
+      return res.status(400).send({
+        success: false,
+        message: "Invalid service ID",
+      });
+    }
+
+    // 2. Validate required fields
+    if (!appointmentDate || !appointmentTime) {
+      return res.status(400).send({
+        success: false,
+        message: "Appointment date and time are required",
+      });
+    }
+
+    // 3. Validate date format
+    if (
+      typeof appointmentDate !== "string" ||
+      !/^\d{4}-\d{2}-\d{2}$/.test(appointmentDate)
+    ) {
+      return res.status(400).send({
+        success: false,
+        message: "Invalid appointment date",
+      });
+    }
+
+    // 4. Validate actual calendar date
+    const [year, month, day] = appointmentDate
+      .split("-")
+      .map(Number);
+
+    const selectedDate = new Date(
+      Date.UTC(year, month - 1, day)
+    );
+
+    if (
+      selectedDate.getUTCFullYear() !== year ||
+      selectedDate.getUTCMonth() !== month - 1 ||
+      selectedDate.getUTCDate() !== day
+    ) {
+      return res.status(400).send({
+        success: false,
+        message: "Invalid appointment date",
+      });
+    }
+
+    // 5. Get today's date in Bangladesh timezone
+    const today = new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Asia/Dhaka",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).format(new Date());
+
+    // 6. Prevent past date booking
+    if (appointmentDate < today) {
+      return res.status(400).send({
+        success: false,
+        message: "Please select today or a future date",
+      });
+    }
+
+    // 7. Validate appointment time
+    const allowedTimes = [
+      "10:00 AM",
+      "11:00 AM",
+      "12:00 PM",
+      "01:00 PM",
+      "02:00 PM",
+      "03:00 PM",
+      "04:00 PM",
+      "05:00 PM",
+    ];
+
+    if (!allowedTimes.includes(appointmentTime)) {
+      return res.status(400).send({
+        success: false,
+        message: "Invalid appointment time",
+      });
+    }
+
+    // 8. Validate customer message
+    if (
+      typeof customerMessage === "string" &&
+      customerMessage.length > 500
+    ) {
+      return res.status(400).send({
+        success: false,
+        message: "Message cannot exceed 500 characters",
+      });
+    }
+
+    // 9. Find active service
+    const service = await servicesCollection.findOne({
+      _id: new ObjectId(serviceId),
+      status: "active",
+    });
+
+    if (!service) {
+      return res.status(404).send({
+        success: false,
+        message: "Service not found or unavailable",
+      });
+    }
+
+    // 10. Find customer
+    const user = await usersCollection.findOne({
+      email: req.user.email,
+    });
+
+    if (!user) {
+      return res.status(404).send({
+        success: false,
+        message: "Customer not found",
+      });
+    }
+
+    // 11. Prevent duplicate active bookings
+    const existingBooking = await appointmentsCollection.findOne({
+      appointmentDate,
+      appointmentTime,
+      status: {
+        $in: ["Pending", "Confirmed"],
+      },
+    });
+
+    if (existingBooking) {
+      return res.status(409).send({
+        success: false,
+        message: "This appointment slot is already booked",
+      });
+    }
+
+    // 12. Create appointment
+    const now = new Date();
 
     const newBooking = {
-      ...bookingData,
+      customerName: user.name || "",
+      customerEmail: user.email,
+      serviceId: service._id,
+      serviceName: service.serviceName,
+      category: service.category,
+      price: service.price,
+      duration: service.duration,
+      image: service.image,
+      appointmentDate,
+      appointmentTime,
+      customerMessage:
+        typeof customerMessage === "string"
+          ? customerMessage.trim()
+          : "",
       status: "Pending",
-      createdAt: new Date(),
+      paymentStatus: "Unpaid",
+      createdAt: now,
+      updatedAt: now,
     };
 
+    // 13. Save to MongoDB
     const result = await appointmentsCollection.insertOne(newBooking);
 
-    res.status(201).send({
+    return res.status(201).send({
       success: true,
       message: "Appointment booked successfully",
-      insertedId: result.insertedId,
+      appointment: {
+        _id: result.insertedId,
+        ...newBooking,
+      },
     });
-  } catch (error) {
-    console.error(error);
 
-    res.status(500).send({
+  } catch (error) {
+    console.error("Booking error:", error);
+
+    return res.status(500).send({
       success: false,
       message: "Failed to book appointment",
     });
   }
 });
 
-
-// app.get("/customer/dashboard-stats", verifyCustomer, async (req, res) => {
-//   try {
-//     const email = req.user.email;
-
-//     const total = await appointmentsCollection.countDocuments({
-//       customerEmail: email,
-//     });
-//     const pending = await appointmentsCollection.countDocuments({
-//       customerEmail: email,
-//       status: "Pending",
-//     });
-//     const confirmed = await appointmentsCollection.countDocuments({
-//       customerEmail: email,
-//       status: "Confirmed",
-//     });
-//     const cancelled = await appointmentsCollection.countDocuments({
-//       customerEmail: email,
-//       status: "Cancelled",
-//     });
-//     res.send({
-//       success: true,
-//       stats: {
-//         total,
-//         pending,
-//         confirmed,
-//         cancelled,
-//       },
-//     });
-//   } catch (error) {
-//     res.status(500).send({
-//       success: false,
-//       message: "Failed to fetch dashboard statistics",
-//     });
-//   }
-// });
-
-
 app.get("/customer/dashboard-stats", verifyCustomer, async (req, res) => {
   try {
-    // Temporary testing only
-    const total = await appointmentsCollection.countDocuments();
+    console.log("User:", req.user);
+    const email = req.user.email;
 
+    const total = await appointmentsCollection.countDocuments({
+      customerEmail: email,
+    });
     const pending = await appointmentsCollection.countDocuments({
+      customerEmail: email,
       status: "Pending",
     });
-
     const confirmed = await appointmentsCollection.countDocuments({
+      customerEmail: email,
       status: "Confirmed",
     });
-
     const cancelled = await appointmentsCollection.countDocuments({
+      customerEmail: email,
       status: "Cancelled",
     });
-
     res.send({
       success: true,
       stats: {
@@ -191,8 +566,6 @@ app.get("/customer/dashboard-stats", verifyCustomer, async (req, res) => {
       },
     });
   } catch (error) {
-    console.error(error);
-
     res.status(500).send({
       success: false,
       message: "Failed to fetch dashboard statistics",
@@ -200,12 +573,10 @@ app.get("/customer/dashboard-stats", verifyCustomer, async (req, res) => {
   }
 });
 
-
-// /customer/appointments
 app.get("/customer/appointments", verifyCustomer, async (req, res) => {
   try {
     const result = await appointmentsCollection
-      .find({})
+      .find({ customerEmail: req.user.email })
       .sort({ createdAt: -1 })
       .toArray();
     res.send({
@@ -217,6 +588,1045 @@ app.get("/customer/appointments", verifyCustomer, async (req, res) => {
     res.status(500).send({
       success: false,
       message: "Failed to fetch appointments",
+    });
+  }
+});
+
+app.patch("/customer/appointments/:id/cancel", verifyCustomer, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({
+        success: false,
+        message: "Invalid appointment ID",
+      });
+    }
+
+    const appointmentId = new ObjectId(id);
+    const appointment = await appointmentsCollection.findOne({
+      _id: appointmentId,
+      customerEmail: req.user.email,
+    });
+
+    if (!appointment) {
+      return res.status(404).send({
+        success: false,
+        message: "Appointment not found",
+      });
+    }
+
+    if (appointment.status !== "Pending") {
+      return res.status(400).send({
+        success: false,
+        message: "Only pending appointments can be cancelled",
+      });
+    }
+
+    const result = await appointmentsCollection.updateOne(
+      {
+        _id: appointmentId,
+        customerEmail: req.user.email,
+        status: "Pending",
+      },
+      {
+        $set: {
+          status: "Cancelled",
+          cancelledAt: new Date(),
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(409).send({
+        success: false,
+        message: "Appointment status changed. Please refresh and try again.",
+      });
+    }
+
+    const updated = await appointmentsCollection.findOne({
+      _id: appointmentId,
+    });
+
+    res.send({
+      success: true,
+      message: "Appointment cancelled successfully",
+      appointment: updated,
+    });
+  } catch (error) {
+    console.error("Appointment cancel error:", error);
+    res.status(500).send({
+      success: false,
+      message: "Failed to cancel appointment",
+    });
+  }
+});
+
+app.patch("/customer/appointments/:id/pay", verifyCustomer, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({
+        success: false,
+        message: "Invalid appointment ID",
+      });
+    }
+
+    const appointmentId = new ObjectId(id);
+    const appointment = await appointmentsCollection.findOne({
+      _id: appointmentId,
+      customerEmail: req.user.email,
+    });
+
+    if (!appointment) {
+      return res.status(404).send({
+        success: false,
+        message: "Appointment not found",
+      });
+    }
+
+    if (appointment.status !== "Confirmed") {
+      return res.status(400).send({
+        success: false,
+        message: "Only confirmed appointments can be paid",
+      });
+    }
+
+    if (appointment.paymentStatus === "Paid") {
+      return res.status(400).send({
+        success: false,
+        message: "This appointment is already paid",
+      });
+    }
+
+    const result = await appointmentsCollection.updateOne(
+      {
+        _id: appointmentId,
+        customerEmail: req.user.email,
+        status: "Confirmed",
+        paymentStatus: { $ne: "Paid" },
+      },
+      {
+        $set: {
+          paymentStatus: "Paid",
+          paidAt: new Date(),
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(409).send({
+        success: false,
+        message: "Appointment status changed. Please refresh and try again.",
+      });
+    }
+
+    const updated = await appointmentsCollection.findOne({
+      _id: appointmentId,
+    });
+
+    res.send({
+      success: true,
+      message: "Payment successful",
+      appointment: updated,
+    });
+  } catch (error) {
+    console.error("Appointment payment error:", error);
+    res.status(500).send({
+      success: false,
+      message: "Failed to complete payment",
+    });
+  }
+});
+
+
+
+app.get("/customer/profile", verifyCustomer, async (req, res) => {
+  try {
+    const user = await usersCollection.findOne(
+      { email: req.user.email },
+      {
+        projection: {
+          name: 1,
+          email: 1,
+          image: 1,
+          phone: 1,
+          role: 1,
+        },
+      }
+    );
+
+    if (!user) {
+      return res.status(404).send({
+        success: false,
+        message: "User not found",
+      });
+    }
+
+    res.send({
+      success: true,
+      user,
+    });
+  } catch (error) {
+    console.error("Profile Fetch Error:", error);
+    res.status(500).send({
+      success: false,
+      message: "Failed to fetch profile",
+    });
+  }
+});
+
+// ==========================
+app.patch("/customer/profile", verifyCustomer, async (req, res) => {
+  try {
+    const { name, image, phone } = req.body;
+
+    if (!name || typeof name !== "string" || !name.trim()) {
+      return res.status(400).send({
+        success: false,
+        message: "Name is required",
+      });
+    }
+
+    const result = await usersCollection.updateOne(
+      { email: req.user.email },
+      {
+        $set: {
+          name: name.trim(),
+          image: typeof image === "string" ? image : "",
+          phone: typeof phone === "string" ? phone : "",
+        },
+      }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).send({
+        success: false,
+        message: "User not found",
+      });
+    }
+
+    res.send({
+      success: true,
+      message: "Profile updated successfully",
+    });
+  } catch (error) {
+    console.error("Profile Update Error:", error);
+    res.status(500).send({
+      success: false,
+      message: "Failed to update profile",
+    });
+  }
+});
+
+// admin server code 
+
+// List every service (active and inactive) for the admin panel.
+app.get("/admin/services", verifyAdmin, async (req, res) => {
+  try {
+    const services = await servicesCollection
+      .find({})
+      .sort({ createdAt: -1, serviceName: 1 })
+      .toArray();
+
+    res.send({
+      success: true,
+      services,
+    });
+  } catch (error) {
+    console.error("Admin services fetch error:", error);
+    res.status(500).send({
+      success: false,
+      message: "Failed to fetch services",
+    });
+  }
+});
+
+// Create a new service.
+
+
+// app.post("/admin/services", verifyAdmin, async (req, res) => {
+//   try {
+//     const { data, errors } = validateServicePayload(req.body);
+
+//     if (errors.length > 0) {
+//       return res.status(400).send({
+//         success: false,
+//         message: errors[0],
+//         errors,
+//       });
+//     }
+
+//     const now = new Date();
+
+//     const service = {
+//       ...data,
+//       createdAt: now,
+//       updatedAt: now,
+//     };
+
+//     const result = await servicesCollection.insertOne(service);
+
+//     res.status(201).send({
+//       success: true,
+//       message: "Service created successfully",
+//       service: {
+//         _id: result.insertedId,
+//         ...service,
+//       },
+//     });
+//   } catch (error) {
+//     console.error("Admin service create error:", error);
+
+//     res.status(500).send({
+//       success: false,
+//       message: "Failed to create service",
+//     });
+//   }
+// });
+
+
+// Update an existing service.
+app.patch("/admin/services/:id", verifyAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({
+        success: false,
+        message: "Invalid service ID",
+      });
+    }
+
+    const { data, errors } = validateServicePayload(req.body, {
+      partial: true,
+    });
+
+    if (errors.length > 0) {
+      return res.status(400).send({
+        success: false,
+        message: errors[0],
+        errors,
+      });
+    }
+
+    if (Object.keys(data).length === 0) {
+      return res.status(400).send({
+        success: false,
+        message: "No valid fields were provided to update.",
+      });
+    }
+
+    const result = await servicesCollection.updateOne(
+      { _id: new ObjectId(id) },
+      {
+        $set: {
+          ...data,
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).send({
+        success: false,
+        message: "Service not found",
+      });
+    }
+
+    const service = await servicesCollection.findOne({
+      _id: new ObjectId(id),
+    });
+
+    res.send({
+      success: true,
+      message: "Service updated successfully",
+      service,
+    });
+  } catch (error) {
+    console.error("Admin service update error:", error);
+    res.status(500).send({
+      success: false,
+      message: "Failed to update service",
+    });
+  }
+});
+
+// Activate or deactivate a service. Sends an explicit status or toggles it.
+app.patch("/admin/services/:id/status", verifyAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({
+        success: false,
+        message: "Invalid service ID",
+      });
+    }
+
+    const serviceId = new ObjectId(id);
+    const service = await servicesCollection.findOne({ _id: serviceId });
+
+    if (!service) {
+      return res.status(404).send({
+        success: false,
+        message: "Service not found",
+      });
+    }
+
+    let nextStatus;
+    const requestedStatus = req.body?.status;
+
+    if (requestedStatus !== undefined) {
+      const status =
+        typeof requestedStatus === "string"
+          ? requestedStatus.toLowerCase()
+          : "";
+
+      if (!SERVICE_STATUSES.has(status)) {
+        return res.status(400).send({
+          success: false,
+          message: "Status must be either active or inactive.",
+        });
+      }
+
+      nextStatus = status;
+    } else {
+      nextStatus = service.status === "active" ? "inactive" : "active";
+    }
+
+    await servicesCollection.updateOne(
+      { _id: serviceId },
+      {
+        $set: {
+          status: nextStatus,
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    const updated = await servicesCollection.findOne({ _id: serviceId });
+
+    res.send({
+      success: true,
+      message:
+        nextStatus === "active"
+          ? "Service activated successfully"
+          : "Service deactivated successfully",
+      service: updated,
+    });
+  } catch (error) {
+    console.error("Admin service status error:", error);
+    res.status(500).send({
+      success: false,
+      message: "Failed to update service status",
+    });
+  }
+});
+
+// Delete a service.
+app.delete("/admin/services/:id", verifyAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({
+        success: false,
+        message: "Invalid service ID",
+      });
+    }
+
+    const result = await servicesCollection.deleteOne({
+      _id: new ObjectId(id),
+    });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).send({
+        success: false,
+        message: "Service not found",
+      });
+    }
+
+    res.send({
+      success: true,
+      message: "Service deleted successfully",
+    });
+  } catch (error) {
+    console.error("Admin service delete error:", error);
+    res.status(500).send({
+      success: false,
+      message: "Failed to delete service",
+    });
+  }
+});
+
+app.get("/admin/dashboard-stats", verifyAdmin, async (req, res) => {
+  try {
+    const [
+      totalCustomers,
+      totalActiveServices,
+      totalAppointments,
+      pendingAppointments,
+      confirmedAppointments,
+      totalSuccessfulPayments,
+    ] = await Promise.all([
+      usersCollection.countDocuments({
+        role: "customer",
+      }),
+
+      servicesCollection.countDocuments({
+        status: "active",
+      }),
+
+      appointmentsCollection.countDocuments({}),
+
+      appointmentsCollection.countDocuments({
+        status: "Pending",
+      }),
+
+      appointmentsCollection.countDocuments({
+        status: "Confirmed",
+      }),
+
+      appointmentsCollection
+        .aggregate([
+          {
+            $match: {
+              paymentStatus: "Paid",
+            },
+          },
+          {
+            $group: {
+              _id: null,
+              total: {
+                $sum: {
+                  $ifNull: ["$price", { $ifNull: ["$amount", 0] }],
+                },
+              },
+            },
+          },
+        ])
+        .toArray(),
+    ]);
+
+    res.send({
+      totalCustomers,
+      totalActiveServices,
+      totalAppointments,
+      pendingAppointments,
+      confirmedAppointments,
+      totalSuccessfulPayments: totalSuccessfulPayments[0]?.total || 0,
+    });
+  } catch (error) {
+    console.error("Admin dashboard stats error:", error);
+    res.status(500).send({
+      message: "Failed to load admin dashboard statistics",
+    });
+  }
+});
+
+// update and uploead
+
+// app.post(
+//   "/admin/services",
+//   verifyAdmin,
+//   upload.single("image"),
+//   async (req, res) => {
+//     try {
+//       const {
+//         name,
+//         category,
+//         description,
+//         price,
+//         duration,
+//         status,
+//       } = req.body;
+
+//       // Required field validation
+//       if (
+//         !name ||
+//         !category ||
+//         !description ||
+//         !price ||
+//         !duration
+//       ) {
+//         return res.status(400).send({
+//           message: "All fields are required",
+//         });
+//       }
+
+//       // Number validation
+//       const servicePrice = Number(price);
+//       const serviceDuration = Number(duration);
+
+//       if (
+//         !Number.isFinite(servicePrice) ||
+//         servicePrice <= 0 ||
+//         !Number.isFinite(serviceDuration) ||
+//         serviceDuration <= 0
+//       ) {
+//         return res.status(400).send({
+//           message: "Price and duration must be greater than 0",
+//         });
+//       }
+
+//       // Image validation
+//       if (!req.file) {
+//         return res.status(400).send({
+//           message: "Service image is required",
+//         });
+//       }
+
+//       // Upload image to ImgBB
+//       const formData = new FormData();
+
+//       formData.append(
+//         "image",
+//         new Blob([req.file.buffer], {
+//           type: req.file.mimetype,
+//         }),
+//         req.file.originalname
+//       );
+
+//       const imageResponse = await fetch(
+//         `https://api.imgbb.com/1/upload?key=${process.env.IMGBB_API_KEY}`,
+//         {
+//           method: "POST",
+//           body: formData,
+//         }
+//       );
+
+//       const imageResult = await imageResponse.json();
+
+//       if (!imageResponse.ok || !imageResult.success) {
+//         return res.status(500).send({
+//           message: "Image upload failed",
+//         });
+//       }
+
+//       // Save service in MongoDB
+//       const newService = {
+//         name: name.trim(),
+//         category,
+//         description: description.trim(),
+//         price: servicePrice,
+//         duration: serviceDuration,
+//         image: imageResult.data.url,
+//         status: status || "active",
+//         createdAt: new Date(),
+//       };
+
+//       const result = await servicesCollection.insertOne(newService);
+
+//       res.status(201).send({
+//         success: true,
+//         message: "Service added successfully",
+//         insertedId: result.insertedId,
+//       });
+//     } catch (error) {
+//       console.error("Add service error:", error);
+
+//       res.status(500).send({
+//         message: "Failed to add service",
+//       });
+//     }
+//   }
+// );
+
+
+
+// claud ai
+
+const uploadToImgBB = async (file) => {
+  const formData = new FormData();
+  formData.append(
+    "image",
+    new Blob([file.buffer], { type: file.mimetype }),
+    file.originalname
+  );
+
+  const response = await fetch(
+    `https://api.imgbb.com/1/upload?key=${process.env.IMGBB_API_KEY}`,
+    { method: "POST", body: formData }
+  );
+  const result = await response.json();
+
+  if (!response.ok || !result.success) {
+    throw new Error("Image upload failed");
+  }
+  return result.data.url;
+};
+
+app.post("/admin/services", verifyAdmin,upload.single("image"),async (req, res) => {
+    try {
+      console.log("BODY:", req.body);
+      console.log("FILE:", req.file?.originalname);
+
+      const { data, errors } = validateServicePayload(req.body);
+
+      if (errors.length > 0) {
+        return res.status(400).send({
+          success: false,
+          message: errors[0],
+          errors,
+        });
+      }
+
+      if (!req.file) {
+        return res.status(400).send({
+          success: false,
+          message: "Service image is required.",
+        });
+      }
+
+      data.image = await uploadToImgBB(req.file);
+
+      const now = new Date();
+
+      const service = {
+        ...data,
+        createdAt: now,
+        updatedAt: now,
+      };
+
+      const result = await servicesCollection.insertOne(service);
+
+      res.status(201).send({
+        success: true,
+        message: "Service created successfully",
+        service: {
+          _id: result.insertedId,
+          ...service,
+        },
+      });
+    } catch (error) {
+      console.error("Admin service create error:", error);
+
+      res.status(500).send({
+        success: false,
+        message: error.message || "Failed to create service",
+      });
+    }
+  }
+);
+// admin appoiment 
+// ==================================
+// Admin: Get All Appointments
+app.get("/admin/appointments", verifyAdmin, async (req, res) => {
+  try {
+    const appointments = await appointmentsCollection
+      .find({})
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.send({
+      success: true,
+      appointments,
+    });
+  } catch (error) {
+    console.error("Get appointments error:", error);
+
+    res.status(500).send({
+      success: false,
+      message: "Failed to fetch appointments",
+    });
+  }
+});
+
+
+// admin appoiment : id
+app.get("/admin/appointments/:id", verifyAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({
+        success: false,
+        message: "Invalid appointment ID",
+      });
+    }
+
+    const appointment = await appointmentsCollection.findOne({
+      _id: new ObjectId(id),
+    });
+
+    if (!appointment) {
+      return res.status(404).send({
+        success: false,
+        message: "Appointment not found",
+      });
+    }
+
+    res.send({
+      success: true,
+      appointment,
+    });
+  } catch (error) {
+    console.error("Appointment details error:", error);
+
+    res.status(500).send({
+      success: false,
+      message: "Failed to fetch appointment details",
+    });
+  }
+});
+
+// /admin/appointments/:id/confirm
+
+app.patch("/admin/appointments/:id/confirm", verifyAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({
+        success: false,
+        message: "Invalid appointment ID",
+      });
+    }
+
+    const result = await appointmentsCollection.updateOne(
+      {
+        _id: new ObjectId(id),
+        status: "Pending",
+      },
+      {
+        $set: {
+          status: "Confirmed",
+          confirmedAt: new Date(),
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    if (result.matchedCount === 0) {
+      const appointment = await appointmentsCollection.findOne({
+        _id: new ObjectId(id),
+      });
+
+      if (!appointment) {
+        return res.status(404).send({
+          success: false,
+          message: "Appointment not found",
+        });
+      }
+
+      return res.status(400).send({
+        success: false,
+        message: "Only pending appointments can be confirmed",
+      });
+    }
+
+    const appointment = await appointmentsCollection.findOne({
+      _id: new ObjectId(id),
+    });
+
+    res.send({
+      success: true,
+      message: "Appointment confirmed successfully",
+      appointment,
+    });
+  } catch (error) {
+    console.error("Confirm appointment error:", error);
+
+    res.status(500).send({
+      success: false,
+      message: "Failed to confirm appointment",
+    });
+  }
+});
+
+// /admin/appointments/:id/confirm
+
+app.patch("/admin/appointments/:id/cancel", verifyAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({
+        success: false,
+        message: "Invalid appointment ID",
+      });
+    }
+
+    const result = await appointmentsCollection.updateOne(
+      {
+        _id: new ObjectId(id),
+        status: { $in: ["Pending", "Confirmed"] },
+      },
+      {
+        $set: {
+          status: "Cancelled",
+          cancelledAt: new Date(),
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    if (result.matchedCount === 0) {
+      const appointment = await appointmentsCollection.findOne({
+        _id: new ObjectId(id),
+      });
+
+      if (!appointment) {
+        return res.status(404).send({
+          success: false,
+          message: "Appointment not found",
+        });
+      }
+
+      return res.status(400).send({
+        success: false,
+        message: "Only pending or confirmed appointments can be cancelled",
+      });
+    }
+
+    const appointment = await appointmentsCollection.findOne({
+      _id: new ObjectId(id),
+    });
+
+    res.send({
+      success: true,
+      message: "Appointment cancelled successfully",
+      appointment,
+    });
+  } catch (error) {
+    console.error("Cancel appointment error:", error);
+
+    res.status(500).send({
+      success: false,
+      message: "Failed to cancel appointment",
+    });
+  }
+});
+
+
+// admin user 
+
+app.get("/admin/users", verifyAdmin, async (req, res) => {
+  try {
+    const users = await usersCollection
+      .find({ role: "customer" })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.send({ success: true, users });
+  } catch (error) {
+    res.status(500).send({
+      success: false,
+      message: error.message,
+    });
+  }
+});
+
+// /admin/users/:id
+app.get("/admin/users/:id", verifyAdmin, async (req, res) => {
+  try {
+    const user = await usersCollection.findOne({
+      _id: new ObjectId(req.params.id),
+      role: "customer",
+    });
+
+    if (!user) {
+      return res.status(404).send({
+        success: false,
+        message: "User not found",
+      });
+    }
+
+    res.send({ success: true, user });
+  } catch (error) {
+    res.status(500).send({
+      success: false,
+      message: error.message,
+    });
+  }
+});
+
+// /admin/users/:id/block
+
+app.patch("/admin/users/:id/block", verifyAdmin, async (req, res) => {
+  try {
+    const result = await usersCollection.updateOne(
+      {
+        _id: new ObjectId(req.params.id),
+        role: "customer",
+      },
+      {
+        $set: {
+          blocked: true,
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    if (!result.matchedCount) {
+      return res.status(404).send({
+        success: false,
+        message: "Customer not found",
+      });
+    }
+
+    res.send({ success: true, message: "User blocked successfully" });
+  } catch (error) {
+    res.status(500).send({
+      success: false,
+      message: error.message,
+    });
+  }
+});
+
+// /admin/users/:id/unblock
+app.patch("/admin/users/:id/unblock", verifyAdmin, async (req, res) => {
+  try {
+    const result = await usersCollection.updateOne(
+      {
+        _id: new ObjectId(req.params.id),
+        role: "customer",
+      },
+      {
+        $set: {
+          blocked: false,
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    if (!result.matchedCount) {
+      return res.status(404).send({
+        success: false,
+        message: "Customer not found",
+      });
+    }
+
+    res.send({ success: true, message: "User unblocked successfully" });
+  } catch (error) {
+    res.status(500).send({
+      success: false,
+      message: error.message,
+    });
+  }
+});
+
+// admin transitions
+
+app.get("/admin/transactions", verifyAdmin, async (req, res) => {
+  try {
+    const transactions = await transactionsCollection
+      .find({})
+      .sort({ transactionDate: -1 })
+      .toArray();
+
+    res.send({
+      success: true,
+      transactions,
+    });
+  } catch (error) {
+    res.status(500).send({
+      success: false,
+      message: error.message,
     });
   }
 });
