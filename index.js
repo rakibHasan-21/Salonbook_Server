@@ -42,6 +42,8 @@ app.use(async (req, res, next) => {
   const isProtectedPath =
     req.path.startsWith("/customer/") ||
     req.path.startsWith("/admin/") ||
+    req.path === "/profile" ||
+    req.path.startsWith("/profile/") ||
     req.path === "/bookings";
 
   if (req.method === "OPTIONS" || !isProtectedPath) {
@@ -98,6 +100,27 @@ app.use(async (req, res, next) => {
 // Test route
 const upload = multer({
   storage: multer.memoryStorage(),
+});
+
+const profileUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const allowedTypes = [
+      "image/jpeg",
+      "image/png",
+      "image/webp",
+      "image/gif",
+    ];
+
+    if (!allowedTypes.includes(file.mimetype)) {
+      return cb(
+        new Error("Profile image must be a JPG, PNG, WEBP or GIF file.")
+      );
+    }
+
+    cb(null, true);
+  },
 });
 
 
@@ -177,6 +200,307 @@ const verifyAdmin = async (req, res, next) => {
   req.user.role = role;
   next();
 };
+
+// verifyUser
+// Allows any authenticated account (customer or admin) to manage its own
+// profile. Blocked accounts are rejected inside the route after the database
+// record has been checked.
+const verifyUser = (req, res, next) => {
+  if (!req.user) {
+    return res.status(401).send({
+      success: false,
+      message: "Unauthorized access",
+    });
+  }
+
+  next();
+};
+
+const PROFILE_FORBIDDEN_FIELDS = new Set([
+  "role",
+  "blocked",
+  "isBlocked",
+  "email",
+  "emailVerified",
+  "_id",
+  "id",
+  "userId",
+  "createdAt",
+  "updatedAt",
+]);
+
+const isAccountBlocked = (user) =>
+  user?.blocked === true || user?.isBlocked === true;
+
+const sanitizeProfileUser = (user) => ({
+  _id: user._id,
+  name: user.name || "",
+  email: user.email || "",
+  image: user.image || "",
+  phone: user.phone || "",
+  address: user.address || "",
+  role: user.role || "customer",
+  blocked: isAccountBlocked(user),
+  createdAt: user.createdAt,
+});
+
+const validateProfilePayload = (body) => {
+  const input = body && typeof body === "object" ? body : {};
+  const errors = [];
+  const data = {};
+
+  const forbiddenFields = Object.keys(input).filter((field) =>
+    PROFILE_FORBIDDEN_FIELDS.has(field)
+  );
+
+  if (forbiddenFields.length > 0) {
+    return {
+      data,
+      errors: [
+        `You are not allowed to update: ${forbiddenFields.join(", ")}.`,
+      ],
+    };
+  }
+
+  const name = typeof input.name === "string" ? input.name.trim() : "";
+
+  if (!name) {
+    errors.push("Name is required.");
+  } else if (name.length < 2 || name.length > 80) {
+    errors.push("Name must be between 2 and 80 characters.");
+  } else {
+    data.name = name;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(input, "phone")) {
+    if (input.phone !== null && typeof input.phone !== "string") {
+      errors.push("Phone must be text.");
+    } else {
+      const phone =
+        typeof input.phone === "string" ? input.phone.trim() : "";
+
+      if (phone.length > 20) {
+        errors.push("Phone cannot exceed 20 characters.");
+      } else if (phone && phone.length < 7) {
+        errors.push("Phone must be at least 7 characters.");
+      } else if (phone && !/^[0-9+\-\s()]+$/.test(phone)) {
+        errors.push("Phone contains invalid characters.");
+      } else {
+        data.phone = phone;
+      }
+    }
+  }
+
+  if (Object.prototype.hasOwnProperty.call(input, "address")) {
+    if (input.address !== null && typeof input.address !== "string") {
+      errors.push("Address must be text.");
+    } else {
+      const address =
+        typeof input.address === "string" ? input.address.trim() : "";
+
+      if (address.length > 200) {
+        errors.push("Address cannot exceed 200 characters.");
+      } else {
+        data.address = address;
+      }
+    }
+  }
+
+  if (Object.prototype.hasOwnProperty.call(input, "image")) {
+    if (input.image !== null && typeof input.image !== "string") {
+      errors.push("Profile image must be a URL.");
+    } else {
+      const image =
+        typeof input.image === "string" ? input.image.trim() : "";
+
+      if (image.length > 2048) {
+        errors.push("Profile image URL is too long.");
+      } else if (image) {
+        try {
+          const url = new URL(image);
+
+          if (!["http:", "https:"].includes(url.protocol)) {
+            throw new Error("Invalid protocol");
+          }
+
+          data.image = image;
+        } catch {
+          errors.push("Profile image must be a valid http or https URL.");
+        }
+      } else {
+        data.image = "";
+      }
+    }
+  }
+
+  return { data, errors };
+};
+
+// ==================================
+// Profile: shared by customers and admins
+// ==================================
+
+app.get("/profile", verifyUser, async (req, res) => {
+  try {
+    const user = await usersCollection.findOne({
+      email: req.user.email,
+    });
+
+    if (!user) {
+      return res.status(404).send({
+        success: false,
+        message: "User not found",
+      });
+    }
+
+    if (isAccountBlocked(user)) {
+      return res.status(403).send({
+        success: false,
+        message: "Your account has been blocked",
+      });
+    }
+
+    res.send({
+      success: true,
+      user: sanitizeProfileUser(user),
+    });
+  } catch (error) {
+    console.error("Profile fetch error:", error);
+    res.status(500).send({
+      success: false,
+      message: "Failed to fetch profile",
+    });
+  }
+});
+
+app.patch("/profile", verifyUser, async (req, res) => {
+  try {
+    const user = await usersCollection.findOne({
+      email: req.user.email,
+    });
+
+    if (!user) {
+      return res.status(404).send({
+        success: false,
+        message: "User not found",
+      });
+    }
+
+    if (isAccountBlocked(user)) {
+      return res.status(403).send({
+        success: false,
+        message: "Your account has been blocked",
+      });
+    }
+
+    const { data, errors } = validateProfilePayload(req.body);
+
+    if (errors.length > 0) {
+      return res.status(400).send({
+        success: false,
+        message: errors[0],
+        errors,
+      });
+    }
+
+    // The update always targets the authenticated user's own record. Role,
+    // blocked status, email and identifiers are rejected above.
+    await usersCollection.updateOne(
+      { email: req.user.email },
+      {
+        $set: {
+          ...data,
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    const updated = await usersCollection.findOne({
+      email: req.user.email,
+    });
+
+    res.send({
+      success: true,
+      message: "Profile updated successfully",
+      user: sanitizeProfileUser(updated),
+    });
+  } catch (error) {
+    console.error("Profile update error:", error);
+    res.status(500).send({
+      success: false,
+      message: "Failed to update profile",
+    });
+  }
+});
+
+app.post(
+  "/profile/image",
+  verifyUser,
+  (req, res, next) => {
+    profileUpload.single("image")(req, res, (error) => {
+      if (error) {
+        return res.status(400).send({
+          success: false,
+          message: error.message || "Profile image upload failed",
+        });
+      }
+
+      next();
+    });
+  },
+  async (req, res) => {
+    try {
+      const user = await usersCollection.findOne({
+        email: req.user.email,
+      });
+
+      if (!user) {
+        return res.status(404).send({
+          success: false,
+          message: "User not found",
+        });
+      }
+
+      if (isAccountBlocked(user)) {
+        return res.status(403).send({
+          success: false,
+          message: "Your account has been blocked",
+        });
+      }
+
+      if (!req.file) {
+        return res.status(400).send({
+          success: false,
+          message: "Profile image is required",
+        });
+      }
+
+      const image = await uploadToImgBB(req.file);
+
+      await usersCollection.updateOne(
+        { email: req.user.email },
+        {
+          $set: {
+            image,
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      res.send({
+        success: true,
+        message: "Profile image updated successfully",
+        image,
+      });
+    } catch (error) {
+      console.error("Profile image upload error:", error);
+      res.status(500).send({
+        success: false,
+        message: error.message || "Failed to upload profile image",
+      });
+    }
+  }
+);
 
 // UI api Call
 app.get("/", (req, res) => {
@@ -476,6 +800,7 @@ app.post("/bookings", verifyCustomer, async (req, res) => {
 
     // 11. Prevent duplicate active bookings
     const existingBooking = await appointmentsCollection.findOne({
+        serviceId: service._id,
       appointmentDate,
       appointmentTime,
       status: {
@@ -663,83 +988,15 @@ app.patch("/customer/appointments/:id/cancel", verifyCustomer, async (req, res) 
   }
 });
 
+// Payments are created through Stripe Checkout and verified by the Stripe
+// webhook in the Next.js app. This legacy endpoint must not mark an
+// appointment as paid without a verified Stripe payment.
 app.patch("/customer/appointments/:id/pay", verifyCustomer, async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).send({
-        success: false,
-        message: "Invalid appointment ID",
-      });
-    }
-
-    const appointmentId = new ObjectId(id);
-    const appointment = await appointmentsCollection.findOne({
-      _id: appointmentId,
-      customerEmail: req.user.email,
-    });
-
-    if (!appointment) {
-      return res.status(404).send({
-        success: false,
-        message: "Appointment not found",
-      });
-    }
-
-    if (appointment.status !== "Confirmed") {
-      return res.status(400).send({
-        success: false,
-        message: "Only confirmed appointments can be paid",
-      });
-    }
-
-    if (appointment.paymentStatus === "Paid") {
-      return res.status(400).send({
-        success: false,
-        message: "This appointment is already paid",
-      });
-    }
-
-    const result = await appointmentsCollection.updateOne(
-      {
-        _id: appointmentId,
-        customerEmail: req.user.email,
-        status: "Confirmed",
-        paymentStatus: { $ne: "Paid" },
-      },
-      {
-        $set: {
-          paymentStatus: "Paid",
-          paidAt: new Date(),
-          updatedAt: new Date(),
-        },
-      }
-    );
-
-    if (result.matchedCount === 0) {
-      return res.status(409).send({
-        success: false,
-        message: "Appointment status changed. Please refresh and try again.",
-      });
-    }
-
-    const updated = await appointmentsCollection.findOne({
-      _id: appointmentId,
-    });
-
-    res.send({
-      success: true,
-      message: "Payment successful",
-      appointment: updated,
-    });
-  } catch (error) {
-    console.error("Appointment payment error:", error);
-    res.status(500).send({
-      success: false,
-      message: "Failed to complete payment",
-    });
-  }
+  return res.status(410).send({
+    success: false,
+    message:
+      "Payments are processed through Stripe Checkout. Open My Appointments and click Pay Now.",
+  });
 });
 
 
