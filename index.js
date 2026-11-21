@@ -4,7 +4,7 @@ import cors from "cors";
 import multer from "multer";
 import fs from "node:fs";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+// import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { createRemoteJWKSet, jwtVerify } from "jose";
 import "dotenv/config";
@@ -16,11 +16,11 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const uploadsRoot = path.join(__dirname, "uploads");
 const serviceUploadsDir = path.join(uploadsRoot, "services");
 
-fs.mkdirSync(serviceUploadsDir, { recursive: true });
-
+// fs.mkdirSync(serviceUploadsDir, { recursive: true });
+// app.use(cors())
 // Middleware
 app.use(cors({
-  origin: "http://localhost:3000",
+  origin: process.env.BETTER_AUTH_URL || 'http://localhost:3000', 
   credentials: true,
   allowedHeaders: ["Content-Type", "Authorization"],
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
@@ -37,64 +37,146 @@ const authPath = authBaseURL.endsWith("/api/auth")
   : `${authBaseURL}/api/auth`;
 const jwks = createRemoteJWKSet(new URL(`${authPath}/jwks`));
 
-// Verify the Better Auth token and attach the user to the request.
-app.use(async (req, res, next) => {
-  const isProtectedPath =
-    req.path.startsWith("/customer/") ||
-    req.path.startsWith("/admin/") ||
-    req.path === "/profile" ||
-    req.path.startsWith("/profile/") ||
-    req.path === "/bookings";
+// The Better Auth JWT plugin signs tokens with the app origin as both the
+// issuer and the audience. These can be overridden for custom deployments.
+const jwtIssuer = process.env.JWT_ISSUER || authOrigin;
+const jwtAudience = process.env.JWT_AUDIENCE || authOrigin;
 
-  if (req.method === "OPTIONS" || !isProtectedPath) {
+// Routes that must never be reached without a verified identity. Everything
+// else (public services, static uploads, the health route) stays public.
+const PROTECTED_ROUTE_PREFIXES = [
+  "/admin",
+  "/customer",
+  "/profile",
+  "/bookings",
+];
+
+const isProtectedRoute = (req) => {
+  if (req.method === "OPTIONS") return false;
+
+  const pathname = (req.path || "/").replace(/\/+$/, "") || "/";
+
+  return PROTECTED_ROUTE_PREFIXES.some(
+    (prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`)
+  );
+};
+
+const getBearerToken = (req) => {
+  const header = req.headers.authorization;
+
+  if (typeof header !== "string") return null;
+
+  const [scheme, ...rest] = header.trim().split(/\s+/);
+
+  if (!/^Bearer$/i.test(scheme)) return null;
+
+  const token = rest.join("");
+
+  return token || null;
+};
+
+const sendAuthError = (res, status, code, message) =>
+  res.status(status).send({
+    success: false,
+    code,
+    message,
+  });
+
+// Fallback for clients that authenticate with the Better Auth session cookie
+// instead of a bearer token.
+const getUserFromSessionCookie = async (cookie) => {
+  try {
+    const sessionResponse = await fetch(`${authPath}/get-session`, {
+      headers: { cookie },
+    });
+
+    if (!sessionResponse.ok) return null;
+
+    const sessionData = await sessionResponse.json();
+
+    return sessionData?.user ?? sessionData?.data?.user ?? null;
+  } catch (error) {
+    console.error("Session lookup failed:", error.message);
+    return null;
+  }
+};
+
+// Verify the Better Auth JWT (or session cookie) and attach the user to the
+// request. Protected routes are rejected with 401 when authentication fails.
+app.use(async (req, res, next) => {
+  if (req.method === "OPTIONS") {
     return next();
   }
 
-  const authorization = req.headers.authorization;
+  const protectedRoute = isProtectedRoute(req);
+  const token = getBearerToken(req);
 
-  if (authorization?.startsWith("Bearer ")) {
+  if (token) {
     try {
-      const { payload } = await jwtVerify(
-        authorization.slice(7),
-        jwks,
-        {
-          issuer: authOrigin,
-          audience: authOrigin,
-        }
-      );
-
-      console.log("JWT PAYLOAD:", payload);
+      const { payload } = await jwtVerify(token, jwks, {
+        issuer: jwtIssuer,
+        audience: jwtAudience,
+      });
 
       req.user = payload;
+      req.authSource = "jwt";
       return next();
     } catch (error) {
-      console.error("JWT verification failed:", error.message);
+      const expired = error?.code === "ERR_JWT_EXPIRED";
+
+      console.error(
+        "JWT verification failed:",
+        error?.code || error?.message || error
+      );
+
+      // Only fall through to the cookie session when the client actually sent
+      // one. Otherwise a protected request fails immediately.
+      if (!protectedRoute && !req.headers.cookie) {
+        return next();
+      }
+
+      if (protectedRoute && !req.headers.cookie) {
+        return sendAuthError(
+          res,
+          401,
+          expired ? "TOKEN_EXPIRED" : "INVALID_TOKEN",
+          expired
+            ? "Your session has expired. Please sign in again."
+            : "Invalid or expired authentication token."
+        );
+      }
     }
   }
 
   if (req.headers.cookie) {
-    try {
-      const sessionResponse = await fetch(`${authPath}/get-session`, {
-        headers: {
-          cookie: req.headers.cookie,
-        },
-      });
+    const user = await getUserFromSessionCookie(req.headers.cookie);
 
-      if (sessionResponse.ok) {
-        const sessionData = await sessionResponse.json();
-        const user = sessionData?.user ?? sessionData?.data?.user;
+    if (user) {
+      req.user = user;
+      req.authSource = "session";
+      return next();
+    }
 
-        if (user) {
-          req.user = user;
-          return next();
-        }
-      }
-    } catch (error) {
-      console.error("Session lookup failed:", error.message);
+    if (protectedRoute) {
+      return sendAuthError(
+        res,
+        401,
+        "UNAUTHORIZED",
+        "Your session has expired. Please sign in again."
+      );
     }
   }
 
-  next();
+  if (protectedRoute) {
+    return sendAuthError(
+      res,
+      401,
+      "UNAUTHORIZED",
+      "Authentication required. Please sign in."
+    );
+  }
+
+  return next();
 });
 
 // Test route
@@ -124,8 +206,8 @@ const profileUpload = multer({
 });
 
 
-// verifyToken
-const verifyCustomer = (req, res, next) => {
+
+const verifyCustomer = async (req, res, next) => {
   if (!req.user) {
     return res.status(401).send({
       success: false,
@@ -133,20 +215,46 @@ const verifyCustomer = (req, res, next) => {
     });
   }
 
-  if (req.user.role !== "customer") {
+  let role = req.user.role;
+  let isBlocked =
+    req.user.isBlocked === true || req.user.blocked === true;
+
+  // The JWT payload may not carry role/isBlocked, so confirm with the database.
+  if (req.user.email) {
+    try {
+      const user = await usersCollection.findOne(
+        { email: req.user.email },
+        { projection: { role: 1, blocked: 1, isBlocked: 1 } }
+      );
+
+      if (user) {
+        role = user.role || role;
+        isBlocked = user.blocked === true || user.isBlocked === true;
+      }
+    } catch (error) {
+      console.error("Customer role lookup failed:", error);
+      return res.status(500).send({
+        success: false,
+        message: "Failed to verify customer access",
+      });
+    }
+  }
+
+  if (role !== "customer") {
     return res.status(403).send({
       success: false,
       message: "Only customers can access this resource",
     });
   }
 
-  if (req.user.isBlocked === true) {
+  if (isBlocked) {
     return res.status(403).send({
       success: false,
       message: "Your account has been blocked",
     });
   }
 
+  req.user.role = role;
   next();
 };
 
@@ -527,6 +635,144 @@ const transactionsCollection = database.collection("transactions");
 
 const SERVICE_STATUSES = new Set(["active", "inactive"]);
 
+// ---------------------------------------------------------------------------
+// Search / sorting helpers
+// ---------------------------------------------------------------------------
+
+// Accepted price sort values. Both kebab-case (used by the UI) and snake_case
+// (common in APIs) are supported so clients can pick either convention.
+const PRICE_ASC_SORTS = new Set([
+  "price-asc",
+  "price_asc",
+  "priceasc",
+  "low-to-high",
+  "lowtohigh",
+  "price-low-to-high",
+  "asc",
+  "ascending",
+]);
+
+const PRICE_DESC_SORTS = new Set([
+  "price-desc",
+  "price_desc",
+  "pricedesc",
+  "high-to-low",
+  "hightolow",
+  "price-high-to-low",
+  "desc",
+  "descending",
+]);
+
+const SERVICE_SORT_OPTIONS = {
+  default: { createdAt: -1, _id: -1 },
+  newest: { createdAt: -1, _id: -1 },
+  oldest: { createdAt: 1, _id: 1 },
+  "price-asc": { price: 1, serviceName: 1 },
+  "price-desc": { price: -1, serviceName: 1 },
+  "name-asc": { serviceName: 1 },
+  "name-desc": { serviceName: -1 },
+};
+
+const APPOINTMENT_SORT_OPTIONS = {
+  default: { createdAt: -1, _id: -1 },
+  newest: { createdAt: -1, _id: -1 },
+  oldest: { createdAt: 1, _id: 1 },
+  "price-asc": { price: 1, createdAt: -1 },
+  "price-desc": { price: -1, createdAt: -1 },
+  "date-asc": { appointmentDate: 1, appointmentTime: 1 },
+  "date-desc": { appointmentDate: -1, appointmentTime: -1 },
+};
+
+const escapeRegex = (value) =>
+  String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const getSearchTerm = (query = {}) => {
+  const raw = query.search ?? query.q ?? query.serviceName ?? "";
+
+  if (typeof raw !== "string") return "";
+
+  // Keep the regex bounded so a huge value cannot slow the query down.
+  return raw.trim().slice(0, 100);
+};
+
+// Translate ?sort=price-asc / ?sort=low-to-high / ?sortBy=price&order=desc
+// into a MongoDB sort document.
+const normalizeSort = (query = {}, options, fallback = "default") => {
+  const rawSort = String(query.sort ?? query.sortBy ?? "")
+    .trim()
+    .toLowerCase();
+  const rawOrder = String(query.order ?? query.sortOrder ?? "")
+    .trim()
+    .toLowerCase();
+
+  if (!rawSort) return options[fallback];
+
+  if (options[rawSort]) return options[rawSort];
+
+  if (PRICE_ASC_SORTS.has(rawSort)) {
+    return options["price-asc"] ?? options[fallback];
+  }
+
+  if (PRICE_DESC_SORTS.has(rawSort)) {
+    return options["price-desc"] ?? options[fallback];
+  }
+
+  if (rawSort === "price") {
+    return ["desc", "descending", "high-to-low"].includes(rawOrder)
+      ? options["price-desc"]
+      : options["price-asc"];
+  }
+
+  if (rawSort === "name") {
+    return rawOrder === "desc" ? options["name-desc"] : options["name-asc"];
+  }
+
+  return options[fallback];
+};
+
+// Build a Mongo filter that searches service names case-insensitively and
+// optionally narrows by category.
+const buildServiceFilter = (query = {}, base = {}) => {
+  const filter = { ...base };
+  const search = getSearchTerm(query);
+
+  if (search) {
+    filter.serviceName = { $regex: escapeRegex(search), $options: "i" };
+  }
+
+  if (
+    typeof query.category === "string" &&
+    query.category.trim() &&
+    query.category.trim().toLowerCase() !== "all"
+  ) {
+    filter.category = {
+      $regex: `^${escapeRegex(query.category.trim())}$`,
+      $options: "i",
+    };
+  }
+
+  return filter;
+};
+
+const buildAppointmentFilter = (query = {}, base = {}) => {
+  const filter = { ...base };
+  const search = getSearchTerm(query);
+
+  if (search) {
+    filter.serviceName = { $regex: escapeRegex(search), $options: "i" };
+  }
+
+  return filter;
+};
+
+const getServiceStatusFilter = (query = {}) => {
+  const status =
+    typeof query.status === "string" ? query.status.trim().toLowerCase() : "";
+
+  return SERVICE_STATUSES.has(status) ? status : "";
+};
+
+
 const validateServicePayload = (body, { partial = false } = {}) => {
   const input = body && typeof body === "object" ? body : {};
   const has = (field) => Object.prototype.hasOwnProperty.call(input, field);
@@ -616,29 +862,48 @@ const validateServicePayload = (body, { partial = false } = {}) => {
 };
 
 
-// services/Featured 
+// services/Featured
+// Supports the same ?search= and ?sort= query parameters as /services.
 app.get("/services/Featured", async (req, res) => {
   try {
+    const filter = buildServiceFilter(req.query, { status: "active" });
+
     const result = await servicesCollection
-      .find({ status: "active" })
+      .find(filter)
+      .sort(normalizeSort(req.query, SERVICE_SORT_OPTIONS))
       .limit(6)
       .toArray();
 
     res.send(result);
   } catch (error) {
+    console.error("Featured services fetch error:", error);
     res.status(500).send({
       message: "Failed to fetch featured services",
     });
   }
 });
 
-// Services 
+// Services
+// Examples:
+//   /services?search=hair
+//   /services?sort=price-asc
+//   /services?sort=price-desc&category=Hair%20Care
 app.get("/services", async (req, res) => {
-  const result = await servicesCollection
-    .find({ status: "active" })
-    .toArray();
+  try {
+    const filter = buildServiceFilter(req.query, { status: "active" });
 
-  res.send(result);
+    const result = await servicesCollection
+      .find(filter)
+      .sort(normalizeSort(req.query, SERVICE_SORT_OPTIONS))
+      .toArray();
+
+    res.send(result);
+  } catch (error) {
+    console.error("Services fetch error:", error);
+    res.status(500).send({
+      message: "Failed to fetch services",
+    });
+  }
 });
 // Service Details Page Dynamic route 
 
@@ -900,10 +1165,15 @@ app.get("/customer/dashboard-stats", verifyCustomer, async (req, res) => {
 
 app.get("/customer/appointments", verifyCustomer, async (req, res) => {
   try {
+    const filter = buildAppointmentFilter(req.query, {
+      customerEmail: req.user.email,
+    });
+
     const result = await appointmentsCollection
-      .find({ customerEmail: req.user.email })
-      .sort({ createdAt: -1 })
+      .find(filter)
+      .sort(normalizeSort(req.query, APPOINTMENT_SORT_OPTIONS))
       .toArray();
+
     res.send({
       success: true,
       appointments: result,
@@ -1082,12 +1352,24 @@ app.patch("/customer/profile", verifyCustomer, async (req, res) => {
 // admin server code 
 
 // List every service (active and inactive) for the admin panel.
+// Supports ?search=, ?status=active|inactive and ?sort=price-asc|price-desc.
 app.get("/admin/services", verifyAdmin, async (req, res) => {
   try {
-    const services = await servicesCollection
-      .find({})
-      .sort({ createdAt: -1, serviceName: 1 })
-      .toArray();
+    const filter = buildServiceFilter(req.query);
+    const status = getServiceStatusFilter(req.query);
+
+    if (status) {
+      filter.status = status;
+    }
+
+    const hasSortParam =
+      typeof req.query.sort === "string" && req.query.sort.trim();
+
+    const sort = hasSortParam
+      ? normalizeSort(req.query, SERVICE_SORT_OPTIONS)
+      : { createdAt: -1, serviceName: 1 };
+
+    const services = await servicesCollection.find(filter).sort(sort).toArray();
 
     res.send({
       success: true,
@@ -1572,11 +1854,14 @@ app.post("/admin/services", verifyAdmin,upload.single("image"),async (req, res) 
 // admin appoiment 
 // ==================================
 // Admin: Get All Appointments
+// Supports ?search= (service name) and ?sort=price-asc|price-desc.
 app.get("/admin/appointments", verifyAdmin, async (req, res) => {
   try {
+    const filter = buildAppointmentFilter(req.query);
+
     const appointments = await appointmentsCollection
-      .find({})
-      .sort({ createdAt: -1 })
+      .find(filter)
+      .sort(normalizeSort(req.query, APPOINTMENT_SORT_OPTIONS))
       .toArray();
 
     res.send({
@@ -1890,3 +2175,5 @@ app.get("/admin/transactions", verifyAdmin, async (req, res) => {
 app.listen(PORT, () => {
   console.log(`SalonBook server running on port ${PORT}`);
 });
+
+export default app
