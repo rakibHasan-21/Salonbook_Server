@@ -85,8 +85,7 @@ const sendAuthError = (res, status, code, message) => {
   });
 };
 
-// Fallback for clients that authenticate with the Better Auth session cookie
-// instead of a bearer token.
+
 const getUserFromSessionCookie = async (cookie) => {
   try {
     const sessionResponse = await fetch(`${authPath}/get-session`, {
