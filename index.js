@@ -2019,7 +2019,6 @@ app.get("/admin/users/:id", verifyAdmin, async (req, res) => {
 });
 
 // /admin/users/:id/block
-
 app.patch("/admin/users/:id/block", verifyAdmin, async (req, res) => {
   try {
     const result = await usersCollection.updateOne(
