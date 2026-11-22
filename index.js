@@ -130,8 +130,7 @@ const authenticateRequest = async (req, res, next) => {
         error?.code || error?.message || error
       );
 
-      // Only fall through to the cookie session when the client actually sent
-      // one. Otherwise a protected request fails immediately.
+    
       if (!protectedRoute && !req.headers.cookie) {
         return next();
       }
@@ -1709,115 +1708,6 @@ app.get("/admin/dashboard-stats", verifyAdmin, async (req, res) => {
   }
 });
 
-// update and uploead
-
-// app.post(
-//   "/admin/services",
-//   verifyAdmin,
-//   upload.single("image"),
-//   async (req, res) => {
-//     try {
-//       const {
-//         name,
-//         category,
-//         description,
-//         price,
-//         duration,
-//         status,
-//       } = req.body;
-
-//       // Required field validation
-//       if (
-//         !name ||
-//         !category ||
-//         !description ||
-//         !price ||
-//         !duration
-//       ) {
-//         return res.status(400).send({
-//           message: "All fields are required",
-//         });
-//       }
-
-//       // Number validation
-//       const servicePrice = Number(price);
-//       const serviceDuration = Number(duration);
-
-//       if (
-//         !Number.isFinite(servicePrice) ||
-//         servicePrice <= 0 ||
-//         !Number.isFinite(serviceDuration) ||
-//         serviceDuration <= 0
-//       ) {
-//         return res.status(400).send({
-//           message: "Price and duration must be greater than 0",
-//         });
-//       }
-
-//       // Image validation
-//       if (!req.file) {
-//         return res.status(400).send({
-//           message: "Service image is required",
-//         });
-//       }
-
-//       // Upload image to ImgBB
-//       const formData = new FormData();
-
-//       formData.append(
-//         "image",
-//         new Blob([req.file.buffer], {
-//           type: req.file.mimetype,
-//         }),
-//         req.file.originalname
-//       );
-
-//       const imageResponse = await fetch(
-//         `https://api.imgbb.com/1/upload?key=${process.env.IMGBB_API_KEY}`,
-//         {
-//           method: "POST",
-//           body: formData,
-//         }
-//       );
-
-//       const imageResult = await imageResponse.json();
-
-//       if (!imageResponse.ok || !imageResult.success) {
-//         return res.status(500).send({
-//           message: "Image upload failed",
-//         });
-//       }
-
-//       // Save service in MongoDB
-//       const newService = {
-//         name: name.trim(),
-//         category,
-//         description: description.trim(),
-//         price: servicePrice,
-//         duration: serviceDuration,
-//         image: imageResult.data.url,
-//         status: status || "active",
-//         createdAt: new Date(),
-//       };
-
-//       const result = await servicesCollection.insertOne(newService);
-
-//       res.status(201).send({
-//         success: true,
-//         message: "Service added successfully",
-//         insertedId: result.insertedId,
-//       });
-//     } catch (error) {
-//       console.error("Add service error:", error);
-
-//       res.status(500).send({
-//         message: "Failed to add service",
-//       });
-//     }
-//   }
-// );
-
-
 
 // claud ai
 
@@ -1893,7 +1783,7 @@ app.post("/admin/services", verifyAdmin,upload.single("image"),async (req, res) 
     }
   }
 );
-// admin appoiment 
+
 // ==================================
 // Admin: Get All Appointments
 // Supports ?search= (service name) and ?sort=price-asc|price-desc.
