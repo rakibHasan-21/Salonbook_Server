@@ -1784,7 +1784,6 @@ app.post("/admin/services", verifyAdmin,upload.single("image"),async (req, res) 
   }
 );
 
-// ==================================
 // Admin: Get All Appointments
 // Supports ?search= (service name) and ?sort=price-asc|price-desc.
 app.get("/admin/appointments", verifyAdmin, async (req, res) => {
