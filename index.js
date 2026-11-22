@@ -1,4 +1,4 @@
-import express from "express";
+﻿import express from "express";
 import { MongoClient, ObjectId } from 'mongodb';
 import cors from "cors";
 import multer from "multer";
@@ -37,13 +37,11 @@ const authPath = authBaseURL.endsWith("/api/auth")
   : `${authBaseURL}/api/auth`;
 const jwks = createRemoteJWKSet(new URL(`${authPath}/jwks`));
 
-// The Better Auth JWT plugin signs tokens with the app origin as both the
-// issuer and the audience. These can be overridden for custom deployments.
+
 const jwtIssuer = process.env.JWT_ISSUER || authOrigin;
 const jwtAudience = process.env.JWT_AUDIENCE || authOrigin;
 
-// Routes that must never be reached without a verified identity. Everything
-// else (public services, static uploads, the health route) stays public.
+
 const PROTECTED_ROUTE_PREFIXES = [
   "/admin",
   "/customer",
@@ -75,12 +73,17 @@ const getBearerToken = (req) => {
   return token || null;
 };
 
-const sendAuthError = (res, status, code, message) =>
-  res.status(status).send({
+const sendAuthError = (res, status, code, message) => {
+  if (status === 401) {
+    res.set("WWW-Authenticate", "Bearer");
+  }
+
+  return res.status(status).send({
     success: false,
     code,
     message,
   });
+};
 
 // Fallback for clients that authenticate with the Better Auth session cookie
 // instead of a bearer token.
@@ -103,7 +106,7 @@ const getUserFromSessionCookie = async (cookie) => {
 
 // Verify the Better Auth JWT (or session cookie) and attach the user to the
 // request. Protected routes are rejected with 401 when authentication fails.
-app.use(async (req, res, next) => {
+const authenticateRequest = async (req, res, next) => {
   if (req.method === "OPTIONS") {
     return next();
   }
@@ -177,7 +180,9 @@ app.use(async (req, res, next) => {
   }
 
   return next();
-});
+};
+
+app.use(authenticateRequest);
 
 // Test route
 const upload = multer({
@@ -268,19 +273,20 @@ const verifyAdmin = async (req, res, next) => {
   }
 
   let role = req.user.role;
-  let isBlocked = req.user.isBlocked === true;
+  let isBlocked =
+    req.user.isBlocked === true || req.user.blocked === true;
 
   // The JWT payload may not carry role/isBlocked, so confirm with the database.
   if (req.user.email) {
     try {
       const user = await usersCollection.findOne(
         { email: req.user.email },
-        { projection: { role: 1, isBlocked: 1 } }
+        { projection: { role: 1, isBlocked: 1, blocked: 1 } }
       );
 
       if (user) {
         role = user.role;
-        isBlocked = user.isBlocked === true;
+        isBlocked = user.blocked === true || user.isBlocked === true;
       }
     } catch (error) {
       console.error("Admin role lookup failed:", error);
@@ -683,6 +689,14 @@ const APPOINTMENT_SORT_OPTIONS = {
   "date-desc": { appointmentDate: -1, appointmentTime: -1 },
 };
 
+const TRANSACTION_SORT_OPTIONS = {
+  default: { transactionDate: -1, _id: -1 },
+  newest: { transactionDate: -1, _id: -1 },
+  oldest: { transactionDate: 1, _id: 1 },
+  "price-asc": { paymentAmount: 1, transactionDate: -1 },
+  "price-desc": { paymentAmount: -1, transactionDate: -1 },
+};
+
 const escapeRegex = (value) =>
   String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -760,6 +774,25 @@ const buildAppointmentFilter = (query = {}, base = {}) => {
 
   if (search) {
     filter.serviceName = { $regex: escapeRegex(search), $options: "i" };
+  }
+
+  return filter;
+};
+
+// Transactions are searched by service name (with customer details as a
+// convenience) so the admin transactions page can reuse the same ?search=.
+const buildTransactionFilter = (query = {}, base = {}) => {
+  const filter = { ...base };
+  const search = getSearchTerm(query);
+
+  if (search) {
+    const matcher = { $regex: escapeRegex(search), $options: "i" };
+
+    filter.$or = [
+      { serviceName: matcher },
+      { customerName: matcher },
+      { customerEmail: matcher },
+    ];
   }
 
   return filter;
@@ -1429,70 +1462,81 @@ app.get("/admin/services", verifyAdmin, async (req, res) => {
 
 
 // Update an existing service.
-app.patch("/admin/services/:id", verifyAdmin, async (req, res) => {
-  try {
-    const { id } = req.params;
+app.patch(
+  "/admin/services/:id",
+  verifyAdmin,
+  upload.single("image"),
+  async (req, res) => {
+    try {
+      const { id } = req.params;
 
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).send({
-        success: false,
-        message: "Invalid service ID",
-      });
-    }
-
-    const { data, errors } = validateServicePayload(req.body, {
-      partial: true,
-    });
-
-    if (errors.length > 0) {
-      return res.status(400).send({
-        success: false,
-        message: errors[0],
-        errors,
-      });
-    }
-
-    if (Object.keys(data).length === 0) {
-      return res.status(400).send({
-        success: false,
-        message: "No valid fields were provided to update.",
-      });
-    }
-
-    const result = await servicesCollection.updateOne(
-      { _id: new ObjectId(id) },
-      {
-        $set: {
-          ...data,
-          updatedAt: new Date(),
-        },
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).send({
+          success: false,
+          message: "Invalid service ID",
+        });
       }
-    );
 
-    if (result.matchedCount === 0) {
-      return res.status(404).send({
+      const { data, errors } = validateServicePayload(req.body, {
+        partial: true,
+      });
+
+      if (errors.length > 0) {
+        return res.status(400).send({
+          success: false,
+          message: errors[0],
+          errors,
+        });
+      }
+
+      if (req.file) {
+        data.image = await uploadToImgBB(req.file);
+      } else if (String(req.body?.removeImage).toLowerCase() === "true") {
+        data.image = "";
+      }
+
+      if (Object.keys(data).length === 0) {
+        return res.status(400).send({
+          success: false,
+          message: "No valid fields were provided to update.",
+        });
+      }
+
+      const result = await servicesCollection.updateOne(
+        { _id: new ObjectId(id) },
+        {
+          $set: {
+            ...data,
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      if (result.matchedCount === 0) {
+        return res.status(404).send({
+          success: false,
+          message: "Service not found",
+        });
+      }
+
+      const service = await servicesCollection.findOne({
+        _id: new ObjectId(id),
+      });
+
+      res.send({
+        success: true,
+        message: "Service updated successfully",
+        service,
+      });
+    } catch (error) {
+      console.error("Admin service update error:", error);
+      res.status(500).send({
         success: false,
-        message: "Service not found",
+        message: "Failed to update service",
       });
     }
-
-    const service = await servicesCollection.findOne({
-      _id: new ObjectId(id),
-    });
-
-    res.send({
-      success: true,
-      message: "Service updated successfully",
-      service,
-    });
-  } catch (error) {
-    console.error("Admin service update error:", error);
-    res.status(500).send({
-      success: false,
-      message: "Failed to update service",
-    });
   }
-});
+);
 
 // Activate or deactivate a service. Sends an explicit status or toggles it.
 app.patch("/admin/services/:id/status", verifyAdmin, async (req, res) => {
@@ -2153,12 +2197,14 @@ app.patch("/admin/users/:id/unblock", verifyAdmin, async (req, res) => {
 });
 
 // admin transitions
-
+// Supports ?search= (service name / customer) and ?sort=price-asc|price-desc.
 app.get("/admin/transactions", verifyAdmin, async (req, res) => {
   try {
+    const filter = buildTransactionFilter(req.query);
+
     const transactions = await transactionsCollection
-      .find({})
-      .sort({ transactionDate: -1 })
+      .find(filter)
+      .sort(normalizeSort(req.query, TRANSACTION_SORT_OPTIONS))
       .toArray();
 
     res.send({
