@@ -2082,7 +2082,7 @@ app.patch("/admin/users/:id/unblock", verifyAdmin, async (req, res) => {
   }
 });
 
-// admin transitions
+
 // Supports ?search= (service name / customer) and ?sort=price-asc|price-desc.
 app.get("/admin/transactions", verifyAdmin, async (req, res) => {
   try {
