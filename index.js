@@ -103,8 +103,7 @@ const getUserFromSessionCookie = async (cookie) => {
   }
 };
 
-// Verify the Better Auth JWT (or session cookie) and attach the user to the
-// request. Protected routes are rejected with 401 when authentication fails.
+
 const authenticateRequest = async (req, res, next) => {
   if (req.method === "OPTIONS") {
     return next();
